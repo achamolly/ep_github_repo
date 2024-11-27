@@ -866,6 +866,159 @@ def mso_meshing(N, meshres, currentradius, ps):
 
     return mesh, meshtags, markers
 
+def anterior_meshing(meshres, currentradius):
+    """Mesh is circle with radius _currentradius, containing a polygon with vertices given by
+    _meshmarginpoints, and optionally a rectangular subdomain _hair. Need 3 markers for EP, EE and hair region."""
+
+    '''Create mesh using gmsh and return mesh, along with cell tags for EE (1), EP (2) and facet tags for
+    outerboundary (3)'''
+
+    # markers
+    EP_marker, EE_marker = 1, 2 #EP marker doubles for cut here
+    edge_marker = 3
+
+    gdim = 2  # 2d mesh
+    res_min = meshres  # resolution near cutout
+    res_max = res_min  # resolution far away, pick uniform for now
+
+    # handle correctly on parallel computer
+    rank = MPI.COMM_SELF.rank
+
+    # make sure gmsh is blank and initialized
+    if not gmsh.isInitialized():
+        gmsh.initialize()
+    else:
+        gmsh.finalize()
+        gmsh.initialize()
+
+    gmsh.option.setNumber("General.Verbosity",
+                          2)  # output warnings and errors only, see https://gmsh.info/doc/texinfo/gmsh.html#Gmsh-API
+
+    if rank == 0:
+        '''Use GMSH to generate the mesh'''
+        # (API at https://gitlab.onelab.info/gmsh/gmsh/blob/gmsh_4_10_2/api/gmsh.py)
+
+        # Define margin as mesh contour
+        meshpoints = [0] * 3
+        meshsegments = [0] * 3
+
+        meshpoints[0] = gmsh.model.occ.addPoint(-currentradius, 0, 0, meshSize=meshres)
+        meshpoints[1] = gmsh.model.occ.addPoint(0, 0, 0, meshSize=meshres)
+        meshpoints[2] = gmsh.model.occ.addPoint(currentradius, 0, 0, meshSize=meshres)
+
+        meshsegments[0] = gmsh.model.occ.addLine(meshpoints[2], meshpoints[1])
+        meshsegments[1] = gmsh.model.occ.addLine(meshpoints[1], meshpoints[0])
+        meshsegments[2] = gmsh.model.occ.addCircleArc(meshpoints[0], meshpoints[1], meshpoints[2])
+
+        meshloop = gmsh.model.occ.addCurveLoop(meshsegments)  # 1
+
+        # Define EP and EE mesh
+        eemesh = gmsh.model.occ.addPlaneSurface([meshloop])  # 1
+
+        gmsh.model.occ.synchronize()
+
+        # to get GMSH to mesh the tissue, we add physical markers
+        volumes = gmsh.model.getEntities(
+            dim=gdim)  # entities are returned as a vector of (dim, tag) integer pairs. Here: [(2=gdim,1=tag)]
+        boundaries = gmsh.model.getBoundary(volumes, oriented=False)  # [(1,1), (1,2), (1,3)]
+
+        # Define and tag physical groups
+        gmsh.model.addPhysicalGroup(gdim, [eemesh], EE_marker, name="EE")  # (dim,[tags],tag of the physical group)
+        gmsh.model.addPhysicalGroup(gdim - 1, [3], edge_marker, name="OuterEdge")
+        gmsh.model.addPhysicalGroup(gdim - 1, [1, 2], EP_marker, name="Cut")
+
+        # generate the mesh
+        gmsh.model.mesh.generate(gdim)
+        gmsh.model.mesh.optimize("Netgen")
+
+    if rank == 0:
+        '''import the mesh into dolfinx'''
+        # Get mesh geometry
+        x = extract_geometry(gmsh.model)  # xyz values of the nodes
+        # Get mesh topology for each element
+        topologies = extract_topology_and_markers(gmsh.model)
+        # dictionary containing cell_data (markers) and topology for each element (1d boundary, 2d face) contained in
+        # the mesh
+
+        # Get information about each cell type from the msh files
+        # and determine which of the cells has to highest topological dimension
+        num_cell_types = len(topologies.keys())
+        cell_information = {}
+        cell_dimensions = np.zeros(num_cell_types, dtype=np.int32)
+        for i, element in enumerate(topologies.keys()):
+            properties = gmsh.model.mesh.getElementProperties(element)
+            name, dim, order, num_nodes, local_coords, _ = properties
+            cell_information[i] = {"id": element, "dim": dim, "num_nodes": num_nodes}
+            cell_dimensions[i] = dim
+        # Sort elements by ascending dimension
+        perm_sort = np.argsort(cell_dimensions)
+
+        # Broadcast cell type data and geometric dimension
+        cell_id = cell_information[perm_sort[-1]]["id"]  # cells = units with the highest topological dimension
+        tdim = cell_information[perm_sort[-1]]["dim"]  # tdim is there dimension (2)
+        num_nodes = cell_information[perm_sort[-1]]["num_nodes"]  # 3 nodes (one cell has 3 vertices)
+        cell_id, num_nodes = MPI.COMM_SELF.bcast([cell_id, num_nodes], root=0)  # communicate to other CPUs
+        if tdim - 1 in cell_dimensions:  # for edges
+            num_facet_nodes = MPI.COMM_SELF.bcast(cell_information[perm_sort[-2]]["num_nodes"],
+                                                  root=0)  # 2 nodes per edge (end points)
+            gmsh_facet_id = cell_information[perm_sort[-2]]["id"]  # facets are edges
+            marked_facets = np.asarray(topologies[gmsh_facet_id]["topology"],
+                                       dtype=np.int64)  # topology of the boundary
+            facet_values = np.asarray(topologies[gmsh_facet_id]["cell_data"], dtype=np.int32)  # boundary marker values
+
+        # extract the topology of the cell with the highest topological dimension from topologies
+        cells = np.asarray(topologies[cell_id]["topology"], dtype=np.int64)
+        cell_values = np.asarray(topologies[cell_id]["cell_data"], dtype=np.int32)
+
+    else:
+        cell_id, num_nodes = MPI.COMM_SELF.bcast([None, None], root=0)
+        cells, x = np.empty([0, num_nodes], np.int64), np.empty([0, gdim])
+        cell_values = np.empty((0,), dtype=np.int32)
+        num_facet_nodes = MPI.COMM_SELF.bcast(None, root=0)
+        marked_facets = np.empty((0, num_facet_nodes), dtype=np.int64)
+        facet_values = np.empty((0,), dtype=np.int32)
+
+    # Create distributed mesh
+    ufl_domain = ufl_mesh(cell_id, gdim)  # generate 2D mesh in fenics
+    # Permute cells from MSH to DOLFINx ordering
+    gmsh_cell_perm = cell_perm_array(to_type(str(ufl_domain.ufl_cell())), num_nodes)
+    cells = cells[:, gmsh_cell_perm]
+    # distribute mesh to CPUs
+    mesh = create_mesh(MPI.COMM_SELF, cells, x[:, :gdim], ufl_domain)
+    # extract topological and facets dimension
+    tdim = mesh.topology.dim
+    fdim = tdim - 1
+    # Permute facets from MSH to DOLFINx ordering
+    facet_type = cell_entity_type(to_type(str(ufl_domain.ufl_cell())), fdim,
+                                  0)  # Last argument is 0 as all facets are the same for triangles
+    gmsh_facet_perm = cell_perm_array(facet_type, num_facet_nodes)
+    marked_facets = np.asarray(marked_facets[:, gmsh_facet_perm], dtype=np.int64)
+
+    # Create MeshTags for cell data
+    local_entities, local_values = distribute_entity_data(mesh, tdim, cells, cell_values)
+    mesh.topology.create_connectivity(tdim, 0)
+    adj = adjacencylist(local_entities)
+    ct = meshtags_from_entities(mesh, tdim, adj, np.int32(local_values))
+    ct.name = "Cell tags"
+
+    # Create MeshTags for facets (boundaries)
+    local_entities, local_values = distribute_entity_data(mesh, fdim, marked_facets, facet_values)
+    mesh.topology.create_connectivity(fdim, tdim)
+    adj = adjacencylist(local_entities)
+    ft = meshtags_from_entities(mesh, fdim, adj, np.int32(local_values))
+    ft.name = "Facet tags"
+
+    # close gmsh
+    gmsh.finalize()
+
+    # export markers
+    markers = [EP_marker, EE_marker, edge_marker]
+    meshtags = [ct, ft]
+
+    print('Meshing successful')
+
+    return mesh, meshtags, markers
+
 
 def myos_init(N, Camp, c0, th, zeta, alpha):
     # Initial myosin profile
@@ -1273,20 +1426,20 @@ def VE_femsolve(t, U, V, N, mesh, markers, Ms, coefs, stressobj, stressobj1D, ac
 
     # Elasticity UFL object
     '''I now model the area changes as
-    
+
     1/ufl.det(ufl.Identity(2)-ufl.grad(U)) - acc_ing(t)*Ms[4])
-    
+
     Here:
-    
+
     U is the displacement vector field (so that U = x_new - x_old), and the gradient is taken wrt x_new.
     ufl.Identity(2) is the 2x2 Identity matrix
     acc_ing(t) is the time-integrated area changes (t integral of Eq. S44 in Mehdi’s Paper)
     Ms[4] is the “5th” (counting from 0) geometric area change mode from Mehdi’s paper, i.e. the PS crescent
-    
+
     The deformation gradient tensor F is defined by dx_new = F*dx_old.
     Hence dx_old / dx_new = F^(-1) and F^(-1) = I - dU/dx_new.
     So the first term is 1/det(F^(-1)) = det(F), which should be the correct differential area change.
-    
+
     Finally, the square root is taken to convert area to basal length
     '''
     # Calculate area changes and ensure they are positive
@@ -1326,6 +1479,128 @@ def VE_femsolve(t, U, V, N, mesh, markers, Ms, coefs, stressobj, stressobj1D, ac
     # Define linear variational problem
     a = Mu * ufl.inner(ufl.nabla_grad(v), ufl.nabla_grad(vs)) * ufl.dx + Pen * ufl.dot(v, vs) * ufl.ds
     L = + Pen * UN * ufl.dot(n, vs) * ufl.ds - ufl.inner(s, ufl.grad(vs)) * ufl.dx - ufl.div(vs) * K * ufl.dx
+
+    # Compute solution
+    if solver is None:
+        solver = ModifiedLinearProblem(
+            petsc_options={"ksp_type": "preonly", "pc_type": "lu", "pc_factor_mat_solver_type": "mumps"})
+        print("Info: creating a new solver")
+        sol = solver.solve(a, L, bcs)
+    else:
+        sol = solver.solve(a, L, bcs)
+
+    # Split the mixed solution and collapse
+    u = sol
+
+    return u, un
+
+
+def VE_femsolve_ant(t, U, V, N, mesh, meshtags, markers, Ms, coefs, fric, stressobj, stressobj1D, acc_ing,
+                    tissue_parameters, fem_settings,
+                    el_parameters, hypothesis, ablation_time=None, solver=None):
+    """Solve variational problem for viscoelastic problem"""
+    # see monolithic direct solver at https://docs.fenicsproject.org/dolfinx/v0.4.1/python/demos/demo_stokes.html
+
+    # unpack parameters
+    r0, L_a, g_b, alpha_l, K0, marg_ampl = el_parameters
+    mu, fr = tissue_parameters
+    meshres, pen, THorder = fem_settings
+    EP_marker, EE_marker, edge_marker = markers
+    assert hypothesis in ["basal_tension", "apical_constriction", "yield"]
+
+    tdim = mesh.topology.dim
+    fdim = tdim - 1
+
+    # Boundary Velocity
+    # areaexp = assemble_scalar(form((coefs[0]*Ms[0]+coefs[1]*Ms[1]+coefs[2]*Ms[2]+coefs[3]*Ms[3]+coefs[4]*Ms[4])*ufl.dx))
+    # circumf = assemble_scalar(form(Constant(mesh,PETSc.ScalarType(1.0))*ufl.ds))
+    # un = areaexp/circumf
+    # UN = Constant(mesh,PETSc.ScalarType(areaexp/circumf))
+    un = edge_vel(t)
+    UN = Constant(mesh, PETSc.ScalarType(un))
+    n = ufl.FacetNormal(mesh)
+
+    bcs = []
+
+    # Active Stress
+    Vstress = FunctionSpace(mesh, ufl.TensorElement("Lagrange", mesh.ufl_cell(), THorder))
+    s = Function(Vstress)  # scalar function
+    s.interpolate(stressobj)  # interpolate active stress onto function space
+    Vstress1D = FunctionSpace(mesh, ufl.FiniteElement("Lagrange", mesh.ufl_cell(), THorder))
+    s1d = Function(Vstress1D)  # scalar function
+    s1d.interpolate(stressobj1D)  # interpolate active stress onto function space
+
+    # Define variational problem
+    Mu = Constant(mesh, PETSc.ScalarType(mu))
+    Pen = Constant(mesh, PETSc.ScalarType(pen))
+    AL = Constant(mesh, PETSc.ScalarType(alpha_l))
+    Four = Constant(mesh, PETSc.ScalarType(4))
+    Two = Constant(mesh, PETSc.ScalarType(2))
+    One = Constant(mesh, PETSc.ScalarType(1))
+    Marg_Amp = Constant(mesh, PETSc.ScalarType(marg_ampl))
+    Fric = Constant(mesh, PETSc.ScalarType(fric))
+
+    v = ufl.TrialFunction(V)
+    vs = ufl.TestFunction(V)
+
+    # Elasticity UFL object
+    '''I now model the area changes as
+
+    1/ufl.det(ufl.Identity(2)-ufl.grad(U)) - acc_ing(t)*Ms[4])
+
+    Here:
+
+    U is the displacement vector field (so that U = x_new - x_old), and the gradient is taken wrt x_new.
+    ufl.Identity(2) is the 2x2 Identity matrix
+    acc_ing(t) is the time-integrated area changes (t integral of Eq. S44 in Mehdi’s Paper)
+    Ms[4] is the “5th” (counting from 0) geometric area change mode from Mehdi’s paper, i.e. the PS crescent
+
+    The deformation gradient tensor F is defined by dx_new = F*dx_old.
+    Hence dx_old / dx_new = F^(-1) and F^(-1) = I - dU/dx_new.
+    So the first term is 1/det(F^(-1)) = det(F), which should be the correct differential area change.
+
+    Finally, the square root is taken to convert area to basal length
+    '''
+    # Calculate area changes and ensure they are positive
+    area_change = One / ufl.det(ufl.Identity(2) - ufl.grad(U)) #- acc_ing * Ms[4]
+    area_change = ufl.classes.Conditional(area_change > 0, area_change, 0)
+    r = r0 * ufl.mathfunctions.Sqrt(area_change)
+    # limit compression to 80%
+    r = ufl.classes.Conditional(r < r0 * np.sqrt(0.8), r0 * np.sqrt(0.8), r)
+    if hypothesis == "yield":
+        # k = Constant(mesh, PETSc.ScalarType(1)) # elasticity for compression resistance
+        # beta = Constant(mesh, PETSc.ScalarType(1)) # inverse scale on which extension plateau is reached
+        # br = beta * r
+        # brm = br - ufl.algebra.Power(1 + ufl.algebra.Power(br, 2), 0.5)
+        # brp = br + ufl.algebra.Power(1 + ufl.algebra.Power(br, 2), 0.5)
+        # K = k / (4 * beta ** 2) * (br * (2 + brm) - ufl.mathfunctions.Ln(brp))
+        # K = K0 * (One - r0 ** 3 * ufl.algebra.Power(r, -3))
+        LA = L_a
+        # K = K0 * (Four * r0**3  - Four * ufl.algebra.Power(r, -3) + AL * ufl.algebra.Power(r, -2) + LA)
+        K = K0 * (One - r0 ** 7 * ufl.algebra.Power(r, -7))
+        # K = K0 * (One - r0**3 * ufl.algebra.Power(r, -3))
+    else:
+        if hypothesis == "basal_tension":
+            LA = L_a + Marg_Amp * s1d  # apical AM with bump on margin prop to tension
+            GB = g_b * (-Ms[3] + Ms[0])  # basal tension only at edge and in EP
+        elif hypothesis == "apical_constriction":
+            LA = L_a * (One + (Marg_Amp - One) * (
+                    -Ms[3] + Ms[0]))  # interpret marg_amp as AM amplification in EP and at edge
+            GB = Constant(mesh, PETSc.ScalarType(0))  # no basal tension anywhere
+        K = K0 * (Four * ufl.algebra.Power(r, 3) - Four / ufl.algebra.Power(r, 3)
+                  + AL / ufl.algebra.Power(r, 2) + LA + Two * GB * r)  #
+
+    if (ablation_time is not None) and (t >= ablation_time):
+        # free edge
+        UN = Constant(mesh, PETSc.ScalarType(0.0))
+        Pen = Constant(mesh, PETSc.ScalarType(pen / 1e10))
+
+    # Define linear variational problem
+    ds_edge = ufl.Measure('ds', domain=mesh, subdomain_id=edge_marker, subdomain_data=meshtags[1])
+    ds_cut = ufl.Measure('ds', domain=mesh, subdomain_id=EP_marker, subdomain_data=meshtags[1])
+    a = (Mu * ufl.inner(ufl.nabla_grad(v), ufl.nabla_grad(vs)) * ufl.dx +
+         Pen * ufl.dot(v, vs) * ds_edge + Fric * ufl.dot(v, vs) * ds_cut)
+    L = + Pen * UN * ufl.dot(n, vs) * ds_edge  - ufl.div(vs) * K * ufl.dx
 
     # Compute solution
     if solver is None:
